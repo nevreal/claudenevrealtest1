@@ -3,28 +3,29 @@ import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFa
 
 // ============================================================
 // VECTOR SWARM — original WebXR bullet-hell arcade game
-// Genre: stationary omnidirectional swarm shooter. Player
-// physically leans/ducks/turns to dodge, aims with one hand,
-// reaches to grab floating multiplier orbs with the other.
-// All assets, names, and code are original work.
+// Genre: stationary omnidirectional swarm shooter. Your right-
+// hand ship is the avatar — it fires, and it's what gets hit.
+// Enemies spawn within your peripheral view and actively work
+// to stay visible as you turn your head. All assets, names,
+// and code are original work.
 // ============================================================
 
 let scene, camera, renderer, clock;
 let player;
-let raycastController, grabController;
+let raycastController;
 let controllerGrip1, controllerGrip2;
 let hudCanvas, hudTexture, hudSprite, hudCtx;
 let triggerHeld = false;
 
 const ARENA_RADIUS = 14;
-const PLAYER_HIT_RADIUS = 0.35; // dodge sphere around the headset
-const ORB_GRAB_RADIUS = 0.22;
+const PLAYER_HIT_RADIUS = 0.08; // tight — matches the ship's actual size
+const SPAWN_PERIPHERAL_HALF_ANGLE = THREE.MathUtils.degToRad(70); // enemies spawn within this cone of where you're facing
+const VIEW_SEEK_HALF_ANGLE = THREE.MathUtils.degToRad(55); // enemies drift to stay within this cone of your view
 
 const state = {
   started: false,
   gameOver: false,
   score: 0,
-  multiplier: 1,
   health: 100,
   wave: 1,
   spawnedThisWave: 0,
@@ -33,7 +34,6 @@ const state = {
   enemies: [],
   enemyBullets: [],
   playerBullets: [],
-  orbs: [],
   shotCooldown: 0,
   invulnTimer: 0,
   flashTimer: 0,
@@ -151,9 +151,6 @@ function setupControllers() {
   controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
   player.add(controllerGrip1);
 
-  grabController = renderer.xr.getController(1);
-  player.add(grabController);
-
   controllerGrip2 = renderer.xr.getControllerGrip(1);
   controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
   player.add(controllerGrip2);
@@ -169,11 +166,6 @@ function setupControllers() {
   const aimLine = new THREE.Line(lineGeo, lineMat);
   aimLine.scale.z = 10;
   raycastController.add(aimLine);
-
-  const grabGlowGeo = new THREE.SphereGeometry(ORB_GRAB_RADIUS, 12, 12);
-  const grabGlowMat = new THREE.MeshBasicMaterial({ color: 0xfff066, transparent: true, opacity: 0.18, wireframe: true });
-  const grabGlow = new THREE.Mesh(grabGlowGeo, grabGlowMat);
-  grabController.add(grabGlow);
 }
 
 function buildDroneShip() {
@@ -216,10 +208,6 @@ function drawHud() {
   ctx.font = 'bold 40px monospace';
   ctx.textAlign = 'left';
   ctx.fillText('SCORE ' + state.score, 20, 55);
-
-  ctx.fillStyle = '#fff066';
-  ctx.font = 'bold 32px monospace';
-  ctx.fillText('x' + state.multiplier, 20, 100);
 
   ctx.fillStyle = '#ff2d92';
   ctx.font = 'bold 32px monospace';
@@ -288,7 +276,6 @@ function startGame() {
   state.started = true;
   state.gameOver = false;
   state.score = 0;
-  state.multiplier = 1;
   state.health = 100;
   state.wave = 1;
   state.spawnedThisWave = 0;
@@ -303,7 +290,6 @@ function clearEntities() {
   [...state.enemies].forEach(removeEnemy);
   [...state.enemyBullets].forEach(removeEnemyBullet);
   [...state.playerBullets].forEach(removePlayerBullet);
-  [...state.orbs].forEach(removeOrb);
 }
 
 function restartGame() {
@@ -313,6 +299,14 @@ function restartGame() {
 // ----------------------------------------------------------
 // Enemies
 // ----------------------------------------------------------
+function getForwardYaw() {
+  const forward = new THREE.Vector3(0, 0, -1);
+  forward.applyQuaternion(camera.getWorldQuaternion(new THREE.Quaternion()));
+  forward.y = 0;
+  forward.normalize();
+  return forward;
+}
+
 function spawnEnemy() {
   const tierRoll = Math.random();
   let tier = 1;
@@ -328,10 +322,19 @@ function spawnEnemy() {
   const mat = new THREE.MeshBasicMaterial({ color: colorByTier[tier], wireframe: true });
   const mesh = new THREE.Mesh(geo, mat);
 
-  const angle = Math.random() * Math.PI * 2;
+  const bodyPos = new THREE.Vector3();
+  camera.getWorldPosition(bodyPos);
+  const forward = getForwardYaw();
+  const forwardAngle = Math.atan2(forward.z, forward.x);
+  const angle = forwardAngle + (Math.random() * 2 - 1) * SPAWN_PERIPHERAL_HALF_ANGLE;
+
   const height = 0.8 + Math.random() * 2.0;
   const dist = ARENA_RADIUS * 0.85;
-  mesh.position.set(Math.cos(angle) * dist, height, Math.sin(angle) * dist);
+  mesh.position.set(
+    bodyPos.x + Math.cos(angle) * dist,
+    height,
+    bodyPos.z + Math.sin(angle) * dist
+  );
 
   scene.add(mesh);
 
@@ -343,7 +346,6 @@ function spawnEnemy() {
     radius: sizeByTier[tier],
     speed: 0.5 + Math.random() * 0.4 + state.wave * 0.03,
     fireTimer: 1 + Math.random() * 2,
-    orbitOffset: Math.random() * Math.PI * 2,
     strafeSpeed: (Math.random() - 0.5) * 0.6,
   };
   state.enemies.push(enemy);
@@ -367,35 +369,48 @@ function updateWaveSpawning(dt) {
 }
 
 function updateEnemies(dt) {
-  const playerPos = new THREE.Vector3();
-  camera.getWorldPosition(playerPos);
+  const bodyPos = new THREE.Vector3();
+  camera.getWorldPosition(bodyPos);
+  const forward = getForwardYaw();
+  const shipPos = new THREE.Vector3();
+  raycastController.getWorldPosition(shipPos);
 
   for (const enemy of [...state.enemies]) {
-    const toPlayer = new THREE.Vector3().subVectors(playerPos, enemy.mesh.position);
-    const dist = toPlayer.length();
+    const flatOffset = new THREE.Vector3(enemy.mesh.position.x - bodyPos.x, 0, enemy.mesh.position.z - bodyPos.z);
+    const dist = flatOffset.length();
+    if (dist < 0.001) continue;
+    const outDir = flatOffset.clone().normalize();
 
-    const desiredDist = 4.5;
-    if (dist > desiredDist) {
-      toPlayer.normalize().multiplyScalar(enemy.speed * dt);
-      enemy.mesh.position.add(toPlayer);
-    } else if (dist < desiredDist - 1.5) {
-      toPlayer.normalize().multiplyScalar(-enemy.speed * dt * 0.5);
-      enemy.mesh.position.add(toPlayer);
+    // actively drift to stay within the player's field of view
+    const angleToForward = outDir.angleTo(forward);
+    if (angleToForward > VIEW_SEEK_HALF_ANGLE) {
+      outDir.lerp(forward, Math.min(1, 1.2 * dt));
+      outDir.normalize();
     }
 
-    // orbital strafe for swarm feel
-    const tangent = new THREE.Vector3(-toPlayer.z, 0, toPlayer.x).normalize();
-    enemy.mesh.position.addScaledVector(tangent, enemy.strafeSpeed * dt);
+    // approach/retreat to a comfortable engagement distance
+    const desiredDist = 4.5;
+    let newDist = dist;
+    if (dist > desiredDist) {
+      newDist = Math.max(desiredDist, dist - enemy.speed * dt);
+    } else if (dist < desiredDist - 1.5) {
+      newDist += enemy.speed * dt * 0.5;
+    }
 
+    // tangential strafe for organic swarm motion
+    const tangent = new THREE.Vector3(-outDir.z, 0, outDir.x);
+
+    enemy.mesh.position.x = bodyPos.x + outDir.x * newDist + tangent.x * enemy.strafeSpeed * dt;
+    enemy.mesh.position.z = bodyPos.z + outDir.z * newDist + tangent.z * enemy.strafeSpeed * dt;
     enemy.mesh.position.y = THREE.MathUtils.clamp(enemy.mesh.position.y, 0.5, 3.2);
-    enemy.mesh.lookAt(playerPos);
+
+    enemy.mesh.lookAt(bodyPos.x, enemy.mesh.position.y, bodyPos.z);
     enemy.mesh.rotation.x += dt * 1.5;
 
     enemy.fireTimer -= dt;
     if (enemy.fireTimer <= 0 && dist < ARENA_RADIUS) {
-      enemy.fireTimer = 1.6 + Math.random() * 1.6 - state.wave * 0.03;
-      enemy.fireTimer = Math.max(0.6, enemy.fireTimer);
-      fireEnemyBullet(enemy, playerPos);
+      enemy.fireTimer = Math.max(0.6, 1.6 + Math.random() * 1.6 - state.wave * 0.03);
+      fireEnemyBullet(enemy, shipPos);
     }
   }
 }
@@ -430,8 +445,8 @@ function fireEnemyBullet(enemy, targetPos) {
 }
 
 function updateEnemyBullets(dt) {
-  const playerPos = new THREE.Vector3();
-  camera.getWorldPosition(playerPos);
+  const shipPos = new THREE.Vector3();
+  raycastController.getWorldPosition(shipPos);
 
   for (const b of [...state.enemyBullets]) {
     b.mesh.position.addScaledVector(b.dir, b.speed * dt);
@@ -443,7 +458,7 @@ function updateEnemyBullets(dt) {
     }
 
     if (state.invulnTimer <= 0) {
-      const d = b.mesh.position.distanceTo(playerPos);
+      const d = b.mesh.position.distanceTo(shipPos);
       if (d < PLAYER_HIT_RADIUS) {
         takeDamage(8);
         removeEnemyBullet(b);
@@ -504,8 +519,7 @@ function updatePlayerBullets(dt) {
         enemy.hp -= 1;
         hit = true;
         if (enemy.hp <= 0) {
-          state.score += enemy.value * state.multiplier;
-          spawnOrbChance(enemy.mesh.position);
+          state.score += enemy.value;
           removeEnemy(enemy);
         }
         break;
@@ -527,65 +541,12 @@ function removePlayerBullet(b) {
 }
 
 // ----------------------------------------------------------
-// Orbs (multiplier pickups — reach/lean to grab)
-// ----------------------------------------------------------
-function spawnOrbChance(position) {
-  if (Math.random() < 0.35) {
-    spawnOrb(position);
-  }
-}
-
-function spawnOrb(position) {
-  const geo = new THREE.SphereGeometry(0.13, 12, 12);
-  const mat = new THREE.MeshBasicMaterial({ color: 0xfff066, wireframe: true });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.copy(position);
-  mesh.position.y = THREE.MathUtils.clamp(mesh.position.y + (Math.random() - 0.3) * 0.6, 0.3, 2.2);
-  scene.add(mesh);
-  state.orbs.push({ mesh, life: 9, bobPhase: Math.random() * Math.PI * 2 });
-}
-
-function updateOrbs(dt) {
-  for (const orb of [...state.orbs]) {
-    orb.life -= dt;
-    orb.bobPhase += dt * 2;
-    orb.mesh.position.y += Math.sin(orb.bobPhase) * 0.002;
-    orb.mesh.rotation.y += dt;
-    if (orb.life <= 0) removeOrb(orb);
-  }
-}
-
-function removeOrb(orb) {
-  scene.remove(orb.mesh);
-  orb.mesh.geometry.dispose();
-  orb.mesh.material.dispose();
-  const idx = state.orbs.indexOf(orb);
-  if (idx >= 0) state.orbs.splice(idx, 1);
-}
-
-function updateGrab(dt) {
-  const grabPos = new THREE.Vector3();
-  grabController.getWorldPosition(grabPos);
-
-  for (const orb of [...state.orbs]) {
-    if (orb.mesh.position.distanceTo(grabPos) < ORB_GRAB_RADIUS) {
-      state.multiplier = Math.min(10, state.multiplier + 1);
-      if (state.multiplier >= 10) {
-        state.score += 1000;
-      }
-      removeOrb(orb);
-    }
-  }
-}
-
-// ----------------------------------------------------------
 // Damage / health
 // ----------------------------------------------------------
 function takeDamage(amount) {
   state.health -= amount;
   state.invulnTimer = 0.6;
   state.flashTimer = 0.15;
-  state.multiplier = 1;
   if (state.health <= 0) {
     state.health = 0;
     state.gameOver = true;
@@ -605,8 +566,6 @@ function animate() {
       updateEnemies(dt);
       updatePlayerBullets(dt);
       updateEnemyBullets(dt);
-      updateOrbs(dt);
-      updateGrab(dt);
       if (state.invulnTimer > 0) state.invulnTimer -= dt;
       if (state.flashTimer > 0) {
         state.flashTimer -= dt;
